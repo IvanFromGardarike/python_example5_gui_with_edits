@@ -459,7 +459,12 @@ cs_button_style = "font-size: 18px; padding: 20px; min-width: 300px; font-family
 input_style = "font-size: 18px; padding: 15px; min-width: 300px; font-family: 'Poppins', sans-serif;"
 label_style = "font-size: 16px; font-family: 'Poppins', sans-serif;"
 small_label_style = "font-size: 12px; font-family: 'Poppins', sans-serif;"
-combo_style = "font-size: 16px; font-family: 'Poppins'; padding: 20px;"
+combo_style = """
+    font-size: 16px;
+    font-family: 'Poppins', sans-serif;
+    padding: 20px;
+    background-color: palette(base);
+"""
 
 class DragButton(QPushButton):
     """Custom button that accepts drag and drop."""
@@ -555,11 +560,14 @@ class MainWindow(QWidget):
         self.data_table.setColumnWidth(0, 185)
         self.data_table.setColumnWidth(1, 100)
         self.data_table.setColumnWidth(2, 50)
-        self.data_table.setRowCount(10)
+        #self.data_table.setRowCount(10)
         self.data_table.setHorizontalHeaderLabels(["FileName", "Separation Type", "Status"])
         self.data_table.setMinimumWidth(350)
         self.data_table.setMinimumHeight(350)
         self.data_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        
+        self.data_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.data_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         layout.addWidget(self.data_table, 0, 1, 7, 1, alignment=Qt.AlignmentFlag.AlignTop)
 
