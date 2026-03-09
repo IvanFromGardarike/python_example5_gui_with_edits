@@ -12,11 +12,12 @@ from urllib3.util.retry import Retry
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QAbstractItemView, QGridLayout, QLabel, QDialog,
-    QComboBox, QLineEdit, QFileDialog, QTableWidget, QMessageBox, QScrollArea, QTableWidgetItem, QTextEdit
+    QComboBox, QLineEdit, QFileDialog, QTableWidget, QMessageBox, QScrollArea, QTableWidgetItem, QTextEdit,
+    QHBoxLayout, QVBoxLayout
 )
 import sys
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer
+from PyQt6.QtGui import QIcon, QTextCursor
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -38,6 +39,7 @@ REQUEST_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 120
 MAX_RETRIES = 3
 RETRY_BACKOFF = 0.5
+LOG_FILE = 'mvsep_client.log'
 
 # ============================================================================
 # BASE DIRECTORY & PATHS
@@ -48,6 +50,72 @@ else:
     BASE_DIR = os.path.abspath(os.getcwd())
 
 DB_PATH = os.path.join(BASE_DIR, 'jobs.db')
+LOG_PATH = os.path.join(BASE_DIR, LOG_FILE)
+
+# ============================================================================
+# TRANSLITERATION & MIME HELPERS
+# ============================================================================
+
+# Попытка импортировать unidecode (более полная транслитерация)
+try:
+    from unidecode import unidecode
+    HAVE_UNIDECODE = True
+except ImportError:
+    HAVE_UNIDECODE = False
+    logger.warning("unidecode not installed, using built-in transliteration (Cyrillic only)")
+
+def transliterate(text):
+    """Преобразует текст в ASCII-совместимый вид."""
+    if HAVE_UNIDECODE:
+        return unidecode(text)
+    
+    # Встроенная таблица для кириллицы (если unidecode нет)
+    mapping = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
+        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+        'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ё': 'Yo',
+        'Ж': 'Zh', 'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M',
+        'Н': 'N', 'О': 'O', 'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U',
+        'Ф': 'F', 'Х': 'Kh', 'Ц': 'Ts', 'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Shch',
+        'Ъ': '', 'Ы': 'Y', 'Ь': '', 'Э': 'E', 'Ю': 'Yu', 'Я': 'Ya',
+    }
+    result = []
+    for char in text:
+        result.append(mapping.get(char, char))
+    return ''.join(result)
+
+def get_mime_type(filename):
+    """Определяет MIME-тип по расширению файла."""
+    ext = os.path.splitext(filename)[1].lower()
+    mime_map = {
+        '.mp3': 'audio/mpeg',
+        '.wav': 'audio/wav',
+        '.flac': 'audio/flac',
+        '.m4a': 'audio/mp4',
+        '.mp4': 'audio/mp4',
+        '.ogg': 'audio/ogg',
+        '.oga': 'audio/ogg',
+        '.aac': 'audio/aac',
+        '.aiff': 'audio/aiff',
+        '.aif': 'audio/aiff',
+        '.wma': 'audio/x-ms-wma',
+        '.opus': 'audio/opus',
+        '.webm': 'audio/webm',
+        '.ac3': 'audio/ac3',
+        '.amr': 'audio/amr',
+        '.ape': 'audio/ape',
+        '.au': 'audio/basic',
+        '.dts': 'audio/vnd.dts',
+        '.mka': 'audio/x-matroska',
+        '.ra': 'audio/vnd.rn-realaudio',
+        '.voc': 'audio/x-voc',
+        '.vox': 'audio/x-vox',
+        '.caf': 'audio/x-caf',
+    }
+    return mime_map.get(ext, 'application/octet-stream')
 
 # ============================================================================
 # CONTEXT MANAGER FOR DATABASE (используется только в главном потоке)
@@ -115,8 +183,17 @@ def create_separation(path_to_file, api_token, sep_type, add_opt1, add_opt2, add
         return error_msg, 404
     try:
         with open_file_safe(path_to_file) as f:
+            # Транслитерация имени файла и замена пробелов на подчёркивания
+            original_filename = os.path.basename(path_to_file)
+            name, ext = os.path.splitext(original_filename)
+            safe_name = transliterate(name).replace(' ', '_').replace('-', '_')
+            # Удалим все кроме букв, цифр, точки и подчёркивания
+            safe_name = ''.join(c for c in safe_name if c.isalnum() or c == '_')
+            safe_filename = safe_name + ext
+            mime_type = get_mime_type(original_filename)
+
             files = {
-                'audiofile': f,
+                'audiofile': (safe_filename, f, mime_type),
                 'api_token': (None, api_token),
                 'sep_type': (None, sep_type),
                 'add_opt1': (None, add_opt1),
@@ -125,7 +202,8 @@ def create_separation(path_to_file, api_token, sep_type, add_opt1, add_opt2, add
                 'output_format': (None, '1'),
                 'is_demo': (None, '0'),
             }
-            logger.info(f"Starting separation for: {os.path.basename(path_to_file)}")
+
+            logger.info(f"Starting separation for: {original_filename} -> {safe_filename}")
             session = create_session_with_retries()
             response = session.post(
                 'https://mvsep.com/api/separation/create',
@@ -137,6 +215,7 @@ def create_separation(path_to_file, api_token, sep_type, add_opt1, add_opt2, add
             hash_val = parsed_json["data"]["hash"]
             logger.info(f"Separation created successfully. Hash: {hash_val}")
             return hash_val, response.status_code
+
     except requests.Timeout as e:
         error_msg = f"API request timeout (>{REQUEST_TIMEOUT}s): {e}"
         logger.error(error_msg)
@@ -147,8 +226,13 @@ def create_separation(path_to_file, api_token, sep_type, add_opt1, add_opt2, add
         return error_msg, 503
     except requests.HTTPError as e:
         error_msg = f"HTTP error: {e}"
+        if 'response' in locals() and response is not None:
+            try:
+                logger.error(f"Response body: {response.text}")
+            except:
+                pass
         logger.error(error_msg)
-        return error_msg, getattr(response, 'status_code', 500)
+        return error_msg, getattr(response, 'status_code', 500) if 'response' in locals() else 500
     except (KeyError, json.JSONDecodeError, ValueError) as e:
         error_msg = f"Invalid API response: {e}"
         logger.error(error_msg)
@@ -287,8 +371,8 @@ class SepThread(QThread):
         super().__init__(parent)
         self.api_token = api_token
         self.is_running = True
-        # Создаём отдельное соединение для этого потока (будет открыто в run)
         self.db_path = DB_PATH
+        self.MAX_CONCURRENT_JOBS = 1  # для non‑premium пользователей
 
     def stop(self):
         self.is_running = False
@@ -296,18 +380,16 @@ class SepThread(QThread):
     def run(self):
         """Main loop: process jobs while running."""
         logger.info("Separation thread started")
-        # Открываем собственное соединение с БД для этого потока
         try:
             while self.is_running:
-                # Получаем задания из БД (используем локальное соединение)
                 jobs = self._fetch_jobs()
                 if jobs:
                     for job in jobs:
                         if not self.is_running:
                             break
                         self._process_job(job)
+                        time.sleep(1)  # небольшая пауза между заданиями
                 else:
-                    # Если заданий нет, немного спим, чтобы не грузить процессор
                     time.sleep(2)
         except Exception as e:
             logger.error(f"Fatal error in SepThread: {e}")
@@ -316,7 +398,6 @@ class SepThread(QThread):
             logger.info("Separation thread finished")
 
     def _fetch_jobs(self):
-        """Fetch all jobs from DB using local connection."""
         conn = None
         try:
             conn = sqlite3.connect(self.db_path, timeout=10)
@@ -333,7 +414,6 @@ class SepThread(QThread):
                 conn.close()
 
     def _update_job(self, job_id, **kwargs):
-        """Update job fields with local connection."""
         conn = None
         try:
             conn = sqlite3.connect(self.db_path, timeout=10)
@@ -350,7 +430,6 @@ class SepThread(QThread):
                 conn.close()
 
     def _insert_log(self, job_id, action, comment=""):
-        """Insert log entry with local connection."""
         conn = None
         try:
             conn = sqlite3.connect(self.db_path, timeout=10)
@@ -367,23 +446,44 @@ class SepThread(QThread):
             if conn:
                 conn.close()
 
+    def _count_active_jobs(self):
+        """Возвращает количество заданий в статусе 'Process'."""
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM Jobs WHERE status = 'Process'")
+            count = cursor.fetchone()[0]
+            cursor.close()
+            return count
+        except sqlite3.Error as e:
+            logger.error(f"Error counting active jobs: {e}")
+            return 0
+        finally:
+            if conn:
+                conn.close()
+
     def _process_job(self, job):
-        """Process a single job."""
         job_id = int(job[0])
         status = str(job[6])
         file_path = job[3]
         separation_type = str(job[7])
-        hash_val = job[5]  # может быть None или строка
+        hash_val = job[5]
+
+        # Проверка лимита перед отправкой нового задания
+        if status == "Added":
+            active_count = self._count_active_jobs()
+            if active_count >= self.MAX_CONCURRENT_JOBS:
+                logger.info(f"Active jobs limit reached ({active_count}). Job {job_id} deferred.")
+                return  # пропускаем, повторим позже
 
         if status == "Added":
             self._handle_job_added(job_id, file_path, separation_type,
                                    job[8], job[9], job[10])
         elif status == "Process":
             self._handle_job_process(job_id, hash_val)
-        # Остальные статусы игнорируем (Download, Complete, Error)
 
     def _handle_job_added(self, job_id, file_path, sep_type, opt1, opt2, opt3):
-        """Send file to API and update status."""
         hash_or_error, status_code = create_separation(
             file_path, self.api_token, sep_type, opt1, opt2, opt3
         )
@@ -400,24 +500,25 @@ class SepThread(QThread):
             logger.error(f"Failed to start separation for job {job_id}: {hash_or_error}")
 
     def _handle_job_process(self, job_id, hash_val):
-        """Check result status."""
+        """Проверяет статус разделения. Если файлы готовы, скачивает и делает паузу."""
         self._update_job(job_id, update_time=int(time.time()))
         success, data = check_result(hash_val, timeout=REQUEST_TIMEOUT)
         if success:
             files = data.get('data', {}).get('files', [])
             if not files:
-                self._insert_log(job_id, "No Files", "")
-                logger.warning(f"Job {job_id}: No files returned")
-                # Возможно, стоит перевести в ошибку?
-                self._update_job(job_id, status="Error")
-                return
-            # Для каждого файла запускаем скачивание (в этом же потоке)
+                # файлы ещё не готовы – оставляем в Process, повторим позже
+                logger.info(f"Job {job_id}: result not ready yet, will retry later")
+                return  # ничего не меняем, статус остаётся Process
+
+            # Файлы готовы – скачиваем
+            all_success = True
             for file_info in files:
                 url = file_info.get('url', '').replace('\\/', '/')
                 filename = file_info.get('download', 'unknown.wav')
                 if not url:
                     logger.warning(f"Job {job_id}: Empty URL for file {filename}")
                     continue
+
                 # Получаем output_dir из БД
                 conn = None
                 try:
@@ -442,19 +543,31 @@ class SepThread(QThread):
                     self.progress_updated.emit(f"Job {job_id}: Complete - {filename}")
                     logger.info(f"Job {job_id}: File downloaded - {filename}")
                 else:
+                    all_success = False
                     self._update_job(job_id, status="Error", update_time=int(time.time()))
                     self._insert_log(job_id, "Download Error", message)
                     self.error_occurred.emit(f"Job {job_id}: Download failed - {message}")
                     logger.error(f"Job {job_id}: Download failed - {message}")
+
+            # После завершения обработки задания делаем паузу перед следующим
+            if all_success:
+                logger.info(f"Job {job_id} completed successfully. Pausing 5 seconds before next job...")
+                time.sleep(5)
+            else:
+                logger.info(f"Job {job_id} finished with errors. Pausing 2 seconds before next job...")
+                time.sleep(2)
+
         else:
             self._update_job(job_id, status="Error", update_time=int(time.time()))
             self._insert_log(job_id, "Process -> Error", data.get("error", "Unknown"))
             logger.error(f"Job {job_id} failed: {data.get('error', 'Unknown')}")
+            time.sleep(2)  # пауза после ошибки
 
 # ============================================================================
 # MAIN WINDOW
 # ============================================================================
 button_style = "font-size: 18px; padding: 20px; min-width: 300px; font-family: 'Poppins', sans-serif;"
+small_button_style = "font-size: 14px; padding: 10px; min-width: 120px; font-family: 'Poppins', sans-serif;"
 cs_button_style = "font-size: 18px; padding: 20px; min-width: 300px; font-family: 'Poppins', sans-serif; background-color: #0176b3; border-radius: 0.3rem;"
 input_style = "font-size: 18px; padding: 15px; min-width: 300px; font-family: 'Poppins', sans-serif;"
 label_style = "font-size: 16px; font-family: 'Poppins', sans-serif;"
@@ -495,7 +608,6 @@ class MainWindow(QWidget):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-        # Данные алгоритмов (будут загружены асинхронно)
         self.data = {}
         self.algorithm_fields = {}
         self.alg_opt1 = {}
@@ -506,15 +618,23 @@ class MainWindow(QWidget):
         self.selected_opt3 = "0"
         self.selected_algoritms_list = []
 
-        # Поток обработки разделений
         self.sep_thread = None
 
         self.init_database()
         self.init_ui()
         self.load_algorithms_async()
 
+        # Таймер для автообновления таблицы (каждые 3 секунды)
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh_table)
+        self.timer.start(3000)
+
+        # Таймер для обновления лога (каждые 2 секунды)
+        self.log_timer = QTimer()
+        self.log_timer.timeout.connect(self.update_log_display)
+        self.log_timer.start(2000)
+
     def init_database(self):
-        """Create database tables if not exist."""
         try:
             with get_db_cursor() as cursor:
                 cursor.execute('''
@@ -550,34 +670,13 @@ class MainWindow(QWidget):
     def init_ui(self):
         self.setWindowTitle("MVSep.com API: Create Separation")
         self.setGeometry(50, 50, 400, 400)
-        self.setFixedSize(740, 600)
+        self.setFixedSize(1000, 900)
 
-        layout = QGridLayout()
+        main_layout = QVBoxLayout()
+        top_layout = QHBoxLayout()
 
-        # Data table
-        self.data_table = QTableWidget(self)
-        self.data_table.setColumnCount(3)
-        self.data_table.setColumnWidth(0, 185)
-        self.data_table.setColumnWidth(1, 100)
-        self.data_table.setColumnWidth(2, 50)
-        #self.data_table.setRowCount(10)
-        self.data_table.setHorizontalHeaderLabels(["FileName", "Separation Type", "Status"])
-        self.data_table.setMinimumWidth(350)
-        self.data_table.setMinimumHeight(350)
-        self.data_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        
-        self.data_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.data_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-
-        layout.addWidget(self.data_table, 0, 1, 7, 1, alignment=Qt.AlignmentFlag.AlignTop)
-
-        # File list
-        self.file_list_label = QLabel("Selected Files:")
-        self.file_list_label.setStyleSheet(label_style)
-        layout.addWidget(self.file_list_label, 7, 1, alignment=Qt.AlignmentFlag.AlignTop)
-
-        self.file_list_text = QTextEdit(self)
-        layout.addWidget(self.file_list_text, 8, 1, 3, 1, alignment=Qt.AlignmentFlag.AlignTop)
+        # Левая колонка (элементы управления)
+        left_layout = QVBoxLayout()
 
         # API Token
         self.api_label = QLabel("API Token")
@@ -594,14 +693,14 @@ class MainWindow(QWidget):
             except IOError as e:
                 logger.warning(f"Could not read API token file: {e}")
 
-        layout.addWidget(self.api_label, 0, 0)
-        layout.addWidget(self.api_input, 1, 0)
+        left_layout.addWidget(self.api_label)
+        left_layout.addWidget(self.api_input)
 
         # API Link
         self.api_link_label = QLabel("<a href='https://mvsep.com/ru/full_api'>Get Token</a>")
         self.api_link_label.setStyleSheet(label_style)
         self.api_link_label.setOpenExternalLinks(True)
-        layout.addWidget(self.api_link_label, 2, 0)
+        left_layout.addWidget(self.api_link_label)
 
         # Master button
         self.master_button = QPushButton("Algorithms Master")
@@ -610,12 +709,12 @@ class MainWindow(QWidget):
         self.master_button.clicked.connect(self.start_master)
         self.master_button.setEnabled(False)
         self.master_button.setText("Loading Algorithms...")
-        layout.addWidget(self.master_button, 3, 0)
+        left_layout.addWidget(self.master_button)
 
         # Filename label
         self.filename_label = QLabel("Audio selected:")
         self.filename_label.setStyleSheet(label_style)
-        layout.addWidget(self.filename_label, 4, 0)
+        left_layout.addWidget(self.filename_label)
 
         # File button
         self.file_button = DragButton("Select File")
@@ -623,36 +722,101 @@ class MainWindow(QWidget):
         self.file_button.setStyleSheet(button_style)
         self.file_button.clicked.connect(self.select_file)
         self.file_button.dragged.connect(self.select_drag_file)
-        layout.addWidget(self.file_button, 5, 0)
+        left_layout.addWidget(self.file_button)
 
         # Clear files button
         self.clear_files_button = QPushButton("Clear Files")
         self.clear_files_button.setStyleSheet(button_style)
         self.clear_files_button.clicked.connect(self.clear_files)
-        layout.addWidget(self.clear_files_button, 6, 0)
+        left_layout.addWidget(self.clear_files_button)
 
         # Output directory
         self.output_dir_label = QLabel(f"Output Dir: {self.output_dir}")
         self.output_dir_label.setStyleSheet(label_style)
-        layout.addWidget(self.output_dir_label, 7, 0)
+        left_layout.addWidget(self.output_dir_label)
 
         self.output_dir_button = QPushButton("Select Output Dir")
         self.output_dir_button.setStyleSheet(button_style)
         self.output_dir_button.clicked.connect(self.select_output_dir)
-        layout.addWidget(self.output_dir_button, 8, 0)
+        left_layout.addWidget(self.output_dir_button)
 
         # Create separation button
         self.create_button = QPushButton("Create Separation")
         self.create_button.setStyleSheet(cs_button_style)
         self.create_button.clicked.connect(self.process_separation)
-        layout.addWidget(self.create_button, 9, 0)
+        left_layout.addWidget(self.create_button)
 
         # Status label
         self.status_label = QLabel("Loading algorithms...")
         self.status_label.setStyleSheet(small_label_style)
-        layout.addWidget(self.status_label, 10, 0)
+        left_layout.addWidget(self.status_label)
 
-        self.setLayout(layout)
+        top_layout.addLayout(left_layout)
+
+        # Правая колонка (таблица и лог)
+        right_layout = QVBoxLayout()
+
+        # Data table
+        self.data_table = QTableWidget(self)
+        self.data_table.setColumnCount(3)
+        self.data_table.setColumnWidth(0, 185)
+        self.data_table.setColumnWidth(1, 100)
+        self.data_table.setColumnWidth(2, 50)
+        self.data_table.setHorizontalHeaderLabels(["FileName", "Separation Type", "Status"])
+        self.data_table.setMinimumWidth(450)
+        self.data_table.setMinimumHeight(300)
+        self.data_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.data_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.data_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        right_layout.addWidget(self.data_table)
+
+        # File list
+        self.file_list_label = QLabel("Selected Files:")
+        self.file_list_label.setStyleSheet(label_style)
+        right_layout.addWidget(self.file_list_label)
+
+        self.file_list_text = QTextEdit(self)
+        self.file_list_text.setMaximumHeight(80)
+        right_layout.addWidget(self.file_list_text)
+
+        # Кнопки управления таблицей и логом
+        buttons_layout = QHBoxLayout()
+        refresh_button = QPushButton("Refresh Table")
+        refresh_button.setStyleSheet(small_button_style)
+        refresh_button.clicked.connect(self.refresh_table)
+        buttons_layout.addWidget(refresh_button)
+
+        clean_table_button = QPushButton("Clean Table")
+        clean_table_button.setStyleSheet(small_button_style)
+        clean_table_button.clicked.connect(self.clean_table)
+        buttons_layout.addWidget(clean_table_button)
+
+        clean_log_button = QPushButton("Clean Log")
+        clean_log_button.setStyleSheet(small_button_style)
+        clean_log_button.clicked.connect(self.clean_log)
+        buttons_layout.addWidget(clean_log_button)
+
+        right_layout.addLayout(buttons_layout)
+
+        # Лог-бокс
+        self.log_label = QLabel("Application Log:")
+        self.log_label.setStyleSheet(label_style)
+        right_layout.addWidget(self.log_label)
+
+        self.log_text = QTextEdit(self)
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(250)
+        self.log_text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        right_layout.addWidget(self.log_text)
+
+        top_layout.addLayout(right_layout)
+        main_layout.addLayout(top_layout)
+        self.setLayout(main_layout)
+
+        # Первое обновление таблицы и лога
+        self.refresh_table()
+        self.update_log_display()
 
     def load_algorithms_async(self):
         try:
@@ -702,7 +866,7 @@ class MainWindow(QWidget):
                 self,
                 "Select File",
                 "",
-                "Audio Files (*.mp3 *.wav *.flac *.m4a *.mp4)"
+                "Audio Files (*.mp3 *.wav *.flac *.m4a *.mp4 *.ogg *.aac *.aiff *.wma *.opus *.webm *.ac3 *.amr *.ape *.au *.dts *.mka *.ra *.voc *.vox *.caf)"
             )
             if selected_files_tuple and selected_files_tuple[0]:
                 self.selected_files = selected_files_tuple[0]
@@ -747,6 +911,80 @@ class MainWindow(QWidget):
         self.file_button.setStyleSheet(button_style)
         self.api_input.setStyleSheet(input_style)
 
+    def is_job_duplicate(self, file_path, sep_type, opt1, opt2, opt3):
+        """Проверяет, есть ли уже активное задание с такими же параметрами."""
+        with get_db_cursor() as cursor:
+            cursor.execute('''
+                SELECT id FROM Jobs 
+                WHERE filename = ? AND separation = ? AND option1 = ? AND option2 = ? AND option3 = ? 
+                AND status IN ('Added', 'Process')
+            ''', (file_path, sep_type, opt1, opt2, opt3))
+            return cursor.fetchone() is not None
+
+    def refresh_table(self):
+        """Обновить таблицу данными из БД."""
+        try:
+            with get_db_cursor() as cursor:
+                cursor.execute('SELECT filename, separation, status FROM Jobs ORDER BY id DESC')
+                rows = cursor.fetchall()
+            logger.debug(f"Refreshing table: {len(rows)} rows")
+            self.data_table.setRowCount(len(rows))
+            for i, row in enumerate(rows):
+                for j, value in enumerate(row):
+                    self.data_table.setItem(i, j, QTableWidgetItem(str(value)))
+        except Exception as e:
+            logger.error(f"Error refreshing table: {e}")
+
+    def clean_table(self):
+        """Очистить таблицу Jobs в БД."""
+        reply = QMessageBox.question(
+            self, "Confirm Clean",
+            "Are you sure you want to delete ALL jobs from the database?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                with get_db_cursor() as cursor:
+                    cursor.execute('DELETE FROM Jobs')
+                    cursor.execute('DELETE FROM Log')
+                logger.info("Database table Jobs cleaned")
+                self.refresh_table()
+                QMessageBox.information(self, "Success", "Table cleaned successfully.")
+            except Exception as e:
+                logger.error(f"Error cleaning table: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to clean table: {e}")
+
+    def clean_log(self):
+        """Очистить файл лога."""
+        reply = QMessageBox.question(
+            self, "Confirm Clean",
+            "Are you sure you want to clear the application log file?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                with open(LOG_PATH, 'w') as f:
+                    f.write('')
+                logger.info("Log file cleaned")
+                self.update_log_display()
+                QMessageBox.information(self, "Success", "Log file cleaned successfully.")
+            except Exception as e:
+                logger.error(f"Error cleaning log file: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to clean log: {e}")
+
+    def update_log_display(self):
+        """Обновить текстовое поле лога содержимым файла."""
+        try:
+            if os.path.exists(LOG_PATH):
+                with open(LOG_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                self.log_text.setPlainText(content)
+                cursor = self.log_text.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.log_text.setTextCursor(cursor)
+        except Exception as e:
+            logger.error(f"Error updating log display: {e}")
+
     def process_separation(self):
         try:
             api_token = self.api_input.text()
@@ -784,10 +1022,9 @@ class MainWindow(QWidget):
                 self.sep_thread.progress_updated.connect(self.handle_progress_update)
                 self.sep_thread.start()
             else:
-                # Если поток уже работает, просто обновляем токен (на всякий случай)
                 self.sep_thread.api_token = api_token
 
-            # Добавляем задания в БД
+            # Добавляем задания в БД с проверкой дубликатов
             for algo_item in self.selected_algoritms_list:
                 sep_type = algo_item["selected_key"]
                 opt1 = algo_item["selected_opt1"]
@@ -795,6 +1032,10 @@ class MainWindow(QWidget):
                 opt3 = algo_item["selected_opt3"]
 
                 for file_path in self.selected_files:
+                    if self.is_job_duplicate(file_path, sep_type, opt1, opt2, opt3):
+                        logger.warning(f"Job for {os.path.basename(file_path)} with same params already in queue, skipping")
+                        continue
+
                     try:
                         with get_db_cursor() as cursor:
                             cursor.execute(
@@ -818,6 +1059,7 @@ class MainWindow(QWidget):
                         QMessageBox.warning(self, "Error", f"Error creating job: {e}")
                         continue
 
+            self.refresh_table()
             self.create_button.setText("Create Separation +")
             QMessageBox.information(self, "Success", "Separations queued successfully!")
 
@@ -828,13 +1070,14 @@ class MainWindow(QWidget):
     def handle_thread_error(self, error_msg):
         logger.error(f"Thread error: {error_msg}")
         self.status_label.setText(f"❌ Error: {error_msg[:50]}")
+        self.refresh_table()
 
     def handle_progress_update(self, message):
         logger.info(f"Progress: {message}")
         self.status_label.setText(f"✓ {message}")
+        self.refresh_table()
 
     def start_master(self):
-        """Open master dialog to select algorithms."""
         if not self.data:
             QMessageBox.warning(
                 self,
@@ -850,7 +1093,6 @@ class MainWindow(QWidget):
 
         layout = QGridLayout(separation_dialog)
 
-        # Separation type
         self.type_label_master = QLabel("Separation Type")
         self.type_label_master.setStyleSheet(label_style)
 
@@ -864,7 +1106,6 @@ class MainWindow(QWidget):
         layout.addWidget(self.type_label_master, 0, 0)
         layout.addWidget(self.type_combo_master, 1, 0)
 
-        # Options
         self.option1_label_master = QLabel("Additional Option 1")
         self.option1_label_master.setStyleSheet(label_style)
         self.option1_combo_master = QComboBox(separation_dialog)
@@ -889,17 +1130,14 @@ class MainWindow(QWidget):
         layout.addWidget(self.option3_label_master, 6, 0)
         layout.addWidget(self.option3_combo_master, 7, 0)
 
-        # Fill options for first algorithm
         if self.type_combo_master.count() > 0:
             self.on_selection_master_change(0)
 
-        # Add algorithm button
         add_button = QPushButton("Add Algorithm", separation_dialog)
         add_button.setStyleSheet(button_style)
         add_button.clicked.connect(self.add_algoritm)
         layout.addWidget(add_button, 8, 0)
 
-        # Algorithm list (right column)
         self.algo_list_label = QLabel("Selected Algorithms:")
         self.algo_list_label.setStyleSheet(label_style)
         layout.addWidget(self.algo_list_label, 0, 1, alignment=Qt.AlignmentFlag.AlignTop)
@@ -912,13 +1150,11 @@ class MainWindow(QWidget):
 
         self._update_algo_list_text()
 
-        # Select button
         close_button = QPushButton("Select Algorithms", separation_dialog)
         close_button.setStyleSheet(button_style)
         close_button.clicked.connect(separation_dialog.accept)
         layout.addWidget(close_button, 8, 1)
 
-        # Clear button
         clear_algo_button = QPushButton("Clear Algorithms", separation_dialog)
         clear_algo_button.setStyleSheet(button_style)
         clear_algo_button.clicked.connect(self.clear_algo)
@@ -1094,7 +1330,6 @@ class MainWindow(QWidget):
             logger.error(f"Error in on_change_master_option3: {e}")
 
     def closeEvent(self, event):
-        """Handle application closing gracefully."""
         try:
             logger.info("Closing application...")
             if self.sep_thread and self.sep_thread.isRunning():
