@@ -364,57 +364,21 @@ class AlgorithmsLoaderThread(QThread):
 # SEPARATION THREAD
 # ============================================================================
 
-class SepThread(QThread):
-    """Thread-safe separation processing with signals"""
-    
-    # Signals for UI updates
-    status_changed = pyqtSignal(int, str)  # row, status
-    error_occurred = pyqtSignal(str)  # error message
-    progress_updated = pyqtSignal(str)  # progress message
-    
-    def __init__(self, api_token=None, data_table=None, base_dir_label=None):
-        super().__init__()
-        self.data_table = data_table
-        self.api_token = api_token
-        self.base_dir_label = base_dir_label
-        self.is_running = True
-        logger.info("SepThread initialized")
-    
-    def run(self):
-        """Main thread loop with error handling"""
-        try:
-            logger.info("SepThread started")
-            
-            while self.is_running:
-                try:
-                    self.process_jobs()
-                except Exception as e:
-                    logger.error(f"Error in job processing loop: {e}")
-                    self.error_occurred.emit(f"Job processing error: {e}")
-                
-                time.sleep(1)
-        
-        except Exception as e:
-            logger.error(f"Fatal thread error: {e}")
-            self.error_occurred.emit(f"Thread fatal error: {e}")
-        finally:
-            logger.info("SepThread stopped")
-    
-    def process_jobs(self):
+def process_jobs(self):
     """Process all jobs in queue - FIXED"""
     try:
-        # ✅ Get jobs OUTSIDE the context
+        # ✅ FIX #1: Получаем jobs ВНЕ with-блока
         jobs = None
         with get_db_cursor() as cursor:
             cursor.execute('SELECT * FROM Jobs ORDER BY id DESC')
             jobs = cursor.fetchall()
         
-        # ✅ Now process jobs with NEW cursors
+        # ✅ Cursor закрыт, jobs получены
         if jobs:
             for row, job in enumerate(jobs):
                 if not self.is_running:
                     break
-                self.process_single_job(job, row)
+                self.process_single_job(job, row)  # ← БЕЗ cursor!
     
     except sqlite3.Error as e:
         logger.error(f"Database error in process_jobs: {e}")
@@ -429,9 +393,9 @@ def process_single_job(self, job, row):
         separation_type = str(job[7])
         
         if status == "Added":
-            self.handle_job_added(job, job_id, file_path, separation_type)
+            self.handle_job_added(job, job_id, file_path, separation_type)  # ← БЕЗ cursor
         elif status == "Process":
-            self.handle_job_process(job, job_id)
+            self.handle_job_process(job, job_id)  # ← БЕЗ cursor
     
     except Exception as e:
         logger.error(f"Error processing job {job[0]}: {e}")
@@ -446,7 +410,7 @@ def handle_job_added(self, job, job_id, file_path, separation_type):
             job[8], job[9], job[10]
         )
         
-        # ✅ Create NEW cursor for this operation
+        # ✅ FIX #2: Создаём НОВЫЙ cursor для этой операции
         with get_db_cursor() as cursor:
             if status_code == 200:
                 cursor.execute('UPDATE Jobs SET hash = ? WHERE id = ?', (hash_val, job[0]))
@@ -471,96 +435,97 @@ def handle_job_added(self, job, job_id, file_path, separation_type):
     except Exception as e:
         logger.error(f"Error in handle_job_added: {e}")
 
-# ============================================================================
-# DRAG & DROP BUTTON
-# ============================================================================
-
-class DragButton(QPushButton):
-    """Custom button with drag & drop support"""
-    dragged = pyqtSignal()
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.selected_files = []
-    
-    def dragEnterEvent(self, e):
-        try:
-            if e.mimeData().hasUrls():
-                e.accept()
-            else:
-                e.ignore()
-        except Exception as e:
-            logger.error(f"Error in dragEnterEvent: {e}")
-    
-    def dropEvent(self, event):
-        try:
-            self.selected_files = []
-            if event.mimeData().hasUrls():
-                for url in event.mimeData().urls():
-                    file_path = url.toLocalFile()
-                    if os.path.isfile(file_path):
-                        self.selected_files.append(file_path)
-                
-                if self.selected_files:
-                    event.accept()
-                    self.dragged.emit()
-                else:
-                    event.ignore()
-            else:
-                event.ignore()
-        except Exception as e:
-            logger.error(f"Error in dropEvent: {e}")
-            event.ignore()
-    
-    def mouseMoveEvent(self, e):
-        try:
-            if e.buttons() == Qt.MouseButton.LeftButton:
-                drag = QDrag(self)
-                mime = QMimeData()
-                drag.setMimeData(mime)
-                drag.exec(Qt.DropAction.MoveAction)
-        except Exception as e:
-            logger.error(f"Error in mouseMoveEvent: {e}")
-
-# ============================================================================
-# MAIN WINDOW
-# ============================================================================
-
-class MainWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        logger.info("MainWindow initialization started")
+def handle_job_process(self, job, job_id):
+    """Handle job in Process status - FIXED"""
+    try:
+        # ✅ FIX #3: НОВЫЙ cursor
+        with get_db_cursor() as cursor:
+            cursor.execute('UPDATE Jobs SET update_time = ? WHERE id = ?', 
+                         (int(time.time()), job[0]))
         
-        try:
-            self.init_database_tables()
-            self.init_ui()
-            self.load_algorithms_async()  # ✅ Загружаем в фоне!
-            self.start_separation_thread()
-            logger.info("MainWindow initialization completed")
-        except Exception as e:
-            logger.error(f"Error during MainWindow initialization: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to initialize: {e}")
-            raise
-    
-    def init_database_tables(self):
-        """Initialize database tables"""
-        try:
+        success, data = check_result(job[5], timeout=REQUEST_TIMEOUT)
+        
+        if success:
+            self.handle_job_success(job, job_id, data)  # ← БЕЗ cursor
+        else:
+            # ✅ FIX #4: НОВЫЙ cursor для ошибки
             with get_db_cursor() as cursor:
-                # Jobs table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS Jobs (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        start_time INTEGER,
-                        update_time INTEGER,
-                        filename TEXT NOT NULL,
-                        out_dir TEXT NOT NULL,
-                        hash TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        separation INTEGER,
-                        option1 TEXT NOT NULL,
-                        option2 TEXT NOT NULL,
-                        option3 TEXT NOT NULL
-                    )
+                cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Error", job[0]))
+                cursor.execute(
+                    'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
+                    (job_id, int(time.time()), "Process -> Error", data.get("error", "Unknown"))
+                )
+            logger.error(f"Job {job_id} failed: {data.get('error', 'Unknown')}")
+    
+    except Exception as e:
+        logger.error(f"Error in handle_job_process: {e}")
+
+def handle_job_success(self, job, job_id, data):
+    """Handle successful job - FIXED"""
+    try:
+        # ✅ FIX #5: НОВЫЙ cursor для логирования
+        with get_db_cursor() as cursor:
+            cursor.execute(
+                'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
+                (job_id, int(time.time()), "Process -> Success", "")
+            )
+        
+        files = data.get('data', {}).get('files', [])
+        
+        if not files:
+            # ✅ FIX #6: НОВЫЙ cursor для "No Files"
+            with get_db_cursor() as cursor:
+                cursor.execute(
+                    'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
+                    (job_id, int(time.time()), "No Files", "")
+                )
+            logger.warning(f"Job {job_id}: No files returned")
+            return
+        
+        for file_info in files:
+            self.download_job_file(job, job_id, file_info)  # ← БЕЗ cursor
+    
+    except Exception as e:
+        logger.error(f"Error in handle_job_success: {e}")
+
+def download_job_file(self, job, job_id, file_info):
+    """Download single file for job - FIXED"""
+    try:
+        url = file_info.get('url', '').replace('\\/', '/')
+        filename = file_info.get('download', 'unknown.wav')
+        
+        if not url:
+            logger.warning(f"Job {job_id}: Empty URL for file {filename}")
+            return
+        
+        # ✅ FIX #7: НОВЫЙ cursor для статуса
+        with get_db_cursor() as cursor:
+            cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Download", job[0]))
+            cursor.execute('UPDATE Jobs SET update_time = ? WHERE id = ?',
+                         (int(time.time()), job[0]))
+        
+        success, message = download_file(url, filename, job[4], timeout=DOWNLOAD_TIMEOUT)
+        
+        # ✅ FIX #8: НОВЫЙ cursor для финального результата
+        with get_db_cursor() as cursor:
+            if success:
+                cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Complete", job[0]))
+                cursor.execute(
+                    'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
+                    (job_id, int(time.time()), "Download -> Complete", f"File: {filename}")
+                )
+                logger.info(f"Job {job_id}: File downloaded - {filename}")
+                self.progress_updated.emit(f"Job {job_id}: Complete - {filename}")
+            else:
+                cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Error", job[0]))
+                cursor.execute(
+                    'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
+                    (job_id, int(time.time()), "Download Error", message)
+                )
+                logger.error(f"Job {job_id}: Download failed - {message}")
+    
+    except Exception as e:
+        logger.error(f"Error downloading file for job {job_id}: {e}")
                 ''')
                 
                 # Log table
