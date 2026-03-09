@@ -7,6 +7,8 @@ import logging
 import threading
 from datetime import datetime
 from contextlib import contextmanager
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QAbstractItemView, QGridLayout, QLabel, QDialog,
@@ -28,6 +30,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+REQUEST_TIMEOUT = 15  # Таймаут для обычных запросов
+DOWNLOAD_TIMEOUT = 120  # Таймаут для с��ачивания файлов
+MAX_RETRIES = 3  # Максимум попыток переподключения
+RETRY_BACKOFF = 0.5  # Коэффициент ожидания между попытками
 
 # ============================================================================
 # FILE DIRECTORY & DATABASE SETUP
@@ -54,6 +64,28 @@ def init_database():
         raise
 
 connection = init_database()
+
+# ============================================================================
+# REQUESTS SESSION WITH RETRY STRATEGY
+# ============================================================================
+
+def create_session_with_retries():
+    """Create requests session with retry strategy"""
+    session = requests.Session()
+    
+    # Retry strategy: повторные попытки при сетевых ошибках
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=RETRY_BACKOFF,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
 
 # ============================================================================
 # UI STYLES
@@ -105,12 +137,12 @@ def open_file_safe(path, mode='rb'):
                 logger.error(f"Error closing file ({path}): {e}")
 
 # ============================================================================
-# API FUNCTIONS WITH ERROR HANDLING
+# API FUNCTIONS WITH ERROR HANDLING & TIMEOUT PROTECTION
 # ============================================================================
 
 def create_separation(path_to_file, api_token, sep_type, add_opt1, add_opt2, add_opt3):
     """
-    Create separation with comprehensive error handling
+    Create separation with comprehensive error handling and timeout protection
     Returns: (hash_or_error, status_code)
     """
     if not os.path.isfile(path_to_file):
@@ -133,10 +165,13 @@ def create_separation(path_to_file, api_token, sep_type, add_opt1, add_opt2, add
             
             logger.info(f"Starting separation for: {os.path.basename(path_to_file)}")
             
-            response = requests.post(
+            session = create_session_with_retries()
+            
+            # ✅ КРИТИЧНО: timeout для POST запроса
+            response = session.post(
                 'https://mvsep.com/api/separation/create',
                 files=files,
-                timeout=30
+                timeout=(5, REQUEST_TIMEOUT)  # (connect_timeout, read_timeout)
             )
             response.raise_for_status()
             
@@ -146,18 +181,18 @@ def create_separation(path_to_file, api_token, sep_type, add_opt1, add_opt2, add
             
             return hash_val, response.status_code
             
-    except requests.Timeout:
-        error_msg = "API request timeout (30s)"
+    except requests.Timeout as e:
+        error_msg = f"API request timeout (>{REQUEST_TIMEOUT}s): {e}"
         logger.error(error_msg)
         return error_msg, 504
     except requests.ConnectionError as e:
-        error_msg = f"Connection error: {e}"
+        error_msg = f"Connection error (check your internet): {e}"
         logger.error(error_msg)
         return error_msg, 503
     except requests.HTTPError as e:
         error_msg = f"HTTP error: {e}"
         logger.error(error_msg)
-        return error_msg, response.status_code
+        return error_msg, getattr(response, 'status_code', 500)
     except (KeyError, json.JSONDecodeError, ValueError) as e:
         error_msg = f"Invalid API response: {e}"
         logger.error(error_msg)
@@ -167,11 +202,18 @@ def create_separation(path_to_file, api_token, sep_type, add_opt1, add_opt2, add
         logger.error(error_msg)
         return error_msg, 500
 
-def get_separation_types():
-    """Fetch separation types with error handling"""
+def get_separation_types(timeout=REQUEST_TIMEOUT):
+    """
+    Fetch separation types with error handling and timeout
+    Returns: (result_dict, algorithm_fields_dict)
+    """
     try:
         api_url = 'https://mvsep.com/api/app/algorithms'
-        response = requests.get(api_url, timeout=15)
+        
+        session = create_session_with_retries()
+        
+        # ✅ КРИТИЧНО: timeout для GET запроса
+        response = session.get(api_url, timeout=(5, timeout))
         response.raise_for_status()
         
         data = response.json()
@@ -193,6 +235,12 @@ def get_separation_types():
         logger.info(f"Fetched {len(result)} separation types")
         return result, algorithm_fields_result
         
+    except requests.Timeout as e:
+        logger.error(f"Timeout fetching separation types (>{timeout}s): {e}")
+        return {}, {}
+    except requests.ConnectionError as e:
+        logger.error(f"Connection error fetching types: {e}")
+        return {}, {}
     except requests.RequestException as e:
         logger.error(f"Failed to fetch separation types: {e}")
         return {}, {}
@@ -200,20 +248,30 @@ def get_separation_types():
         logger.error(f"Error parsing separation types: {e}")
         return {}, {}
 
-def check_result(hash_val, timeout=15):
+def check_result(hash_val, timeout=REQUEST_TIMEOUT):
     """Check separation result with error handling"""
     try:
         params = {'hash': hash_val}
-        response = requests.get(
+        
+        session = create_session_with_retries()
+        
+        # ✅ КРИТИЧНО: timeout для проверки результата
+        response = session.get(
             'https://mvsep.com/api/separation/get',
             params=params,
-            timeout=timeout
+            timeout=(5, timeout)
         )
         response.raise_for_status()
         
         data = json.loads(response.content.decode('utf-8'))
         return data.get('success', False), data
         
+    except requests.Timeout as e:
+        logger.error(f"Timeout checking result for hash {hash_val}: {e}")
+        return False, {"error": f"Timeout: {e}"}
+    except requests.ConnectionError as e:
+        logger.error(f"Connection error checking result: {e}")
+        return False, {"error": f"Connection error: {e}"}
     except requests.RequestException as e:
         logger.error(f"Error checking result for hash {hash_val}: {e}")
         return False, {"error": str(e)}
@@ -221,9 +279,9 @@ def check_result(hash_val, timeout=15):
         logger.error(f"JSON decode error: {e}")
         return False, {"error": str(e)}
 
-def download_file(url, filename, save_path, timeout=60):
+def download_file(url, filename, save_path, timeout=DOWNLOAD_TIMEOUT):
     """
-    Download file with error handling and progress tracking
+    Download file with error handling, timeout, and progress tracking
     Returns: (success, message)
     """
     try:
@@ -231,10 +289,20 @@ def download_file(url, filename, save_path, timeout=60):
             os.makedirs(save_path)
         
         logger.info(f"Downloading: {filename}")
-        response = requests.get(url, timeout=timeout, stream=True)
+        
+        session = create_session_with_retries()
+        
+        # ✅ КРИТИЧНО: timeout и stream для больших файлов
+        response = session.get(url, timeout=(5, timeout), stream=True)
         response.raise_for_status()
         
         file_path = os.path.join(save_path, filename)
+        
+        # Проверяем размер файла
+        content_length = response.headers.get('content-length')
+        if content_length:
+            file_size_mb = int(content_length) / (1024 * 1024)
+            logger.info(f"File size: {file_size_mb:.2f} MB")
         
         with open(file_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
@@ -244,6 +312,14 @@ def download_file(url, filename, save_path, timeout=60):
         logger.info(f"File downloaded successfully: {filename}")
         return True, f"File '{filename}' downloaded successfully!"
         
+    except requests.Timeout as e:
+        error_msg = f"Download timeout for '{filename}' (>{timeout}s): {e}"
+        logger.error(error_msg)
+        return False, error_msg
+    except requests.ConnectionError as e:
+        error_msg = f"Download connection error for '{filename}': {e}"
+        logger.error(error_msg)
+        return False, error_msg
     except requests.RequestException as e:
         error_msg = f"Download error for '{filename}': {e}"
         logger.error(error_msg)
@@ -256,6 +332,33 @@ def download_file(url, filename, save_path, timeout=60):
         error_msg = f"Unexpected error downloading '{filename}': {e}"
         logger.error(error_msg)
         return False, error_msg
+
+# ============================================================================
+# BACKGROUND LOADER THREAD (для инициализации UI)
+# ============================================================================
+
+class AlgorithmsLoaderThread(QThread):
+    """Load algorithms in background to prevent UI blocking"""
+    
+    algorithms_loaded = pyqtSignal(dict, dict)  # data, algorithm_fields
+    load_failed = pyqtSignal(str)  # error_message
+    
+    def run(self):
+        """Load algorithms in background"""
+        try:
+            logger.info("Loading algorithms in background...")
+            data, algorithm_fields = get_separation_types(timeout=30)  # Больше времени для фона
+            
+            if data:
+                self.algorithms_loaded.emit(data, algorithm_fields)
+                logger.info("Algorithms loaded successfully")
+            else:
+                self.load_failed.emit("No algorithms fetched")
+                logger.warning("No algorithms fetched")
+        
+        except Exception as e:
+            logger.error(f"Error loading algorithms: {e}")
+            self.load_failed.emit(str(e))
 
 # ============================================================================
 # SEPARATION THREAD
@@ -375,7 +478,7 @@ class SepThread(QThread):
                 cursor.execute('UPDATE Jobs SET update_time = ? WHERE id = ?', 
                              (int(time.time()), job[0]))
             
-            success, data = check_result(job[5], timeout=20)
+            success, data = check_result(job[5], timeout=REQUEST_TIMEOUT)
             
             if success:
                 self.handle_job_success(job, cursor, job_id, data)
@@ -432,7 +535,7 @@ class SepThread(QThread):
                 cursor.execute('UPDATE Jobs SET update_time = ? WHERE id = ?',
                              (int(time.time()), job[0]))
             
-            success, message = download_file(url, filename, job[4], timeout=120)
+            success, message = download_file(url, filename, job[4], timeout=DOWNLOAD_TIMEOUT)
             
             with db_lock:
                 if success:
@@ -522,6 +625,7 @@ class MainWindow(QWidget):
         try:
             self.init_database_tables()
             self.init_ui()
+            self.load_algorithms_async()  # ✅ Загружаем в фоне!
             self.start_separation_thread()
             logger.info("MainWindow initialization completed")
         except Exception as e:
@@ -597,8 +701,9 @@ class MainWindow(QWidget):
         self.selected_opt3 = "0"
         self.selected_algoritms_list = []
         
-        # Fetch separation types
-        self.data, self.algorithm_fields = get_separation_types()
+        # ✅ ПУСТЫЕ данные по умолчанию (загружаем в фоне)
+        self.data = {}
+        self.algorithm_fields = {}
         
         # Data table
         self.data_table = QTableWidget(self)
@@ -651,6 +756,9 @@ class MainWindow(QWidget):
         self.master_button.setAcceptDrops(True)
         self.master_button.setStyleSheet(button_style)
         self.master_button.clicked.connect(self.start_master)
+        # ✅ Отключаем пока загружаются алгоритмы
+        self.master_button.setEnabled(False)
+        self.master_button.setText("Loading Algorithms...")
         layout.addWidget(self.master_button, 3, 0)
         
         # Filename label
@@ -688,12 +796,51 @@ class MainWindow(QWidget):
         self.create_button.clicked.connect(self.process_separation)
         layout.addWidget(self.create_button, 9, 0)
         
-        # Base Dir label
-        self.base_dir_label = QLabel(f"Base Dir: {BASE_DIR}")
-        self.base_dir_label.setStyleSheet(small_label_style)
-        layout.addWidget(self.base_dir_label, 10, 0)
+        # Status label
+        self.status_label = QLabel("Loading algorithms...")
+        self.status_label.setStyleSheet(small_label_style)
+        layout.addWidget(self.status_label, 10, 0)
         
         self.setLayout(layout)
+    
+    def load_algorithms_async(self):
+        """Load algorithms in background thread"""
+        try:
+            self.algo_loader = AlgorithmsLoaderThread()
+            self.algo_loader.algorithms_loaded.connect(self.on_algorithms_loaded)
+            self.algo_loader.load_failed.connect(self.on_algorithms_load_failed)
+            self.algo_loader.start()
+            logger.info("Started background algorithms loader")
+        except Exception as e:
+            logger.error(f"Error starting algorithms loader: {e}")
+            self.on_algorithms_load_failed(str(e))
+    
+    @pyqtSlot(dict, dict)
+    def on_algorithms_loaded(self, data, algorithm_fields):
+        """Handle successful algorithm loading"""
+        try:
+            self.data = data
+            self.algorithm_fields = algorithm_fields
+            self.master_button.setEnabled(True)
+            self.master_button.setText("Algorithms Master")
+            self.status_label.setText(f"Ready! ({len(data)} algorithms)")
+            logger.info(f"Algorithms loaded: {len(data)} available")
+        except Exception as e:
+            logger.error(f"Error handling loaded algorithms: {e}")
+    
+    @pyqtSlot(str)
+    def on_algorithms_load_failed(self, error_msg):
+        """Handle algorithm loading failure"""
+        logger.warning(f"Algorithm loading failed: {error_msg}")
+        self.status_label.setText(f"⚠️ Failed to load: {error_msg}")
+        self.master_button.setEnabled(True)
+        self.master_button.setText("Algorithms Master (Offline)")
+        QMessageBox.warning(
+            self,
+            "Warning",
+            f"Could not load algorithms from server:\n{error_msg}\n\n"
+            "Check your internet connection or try again later."
+        )
     
     def start_separation_thread(self):
         """Start the separation processing thread"""
@@ -701,7 +848,7 @@ class MainWindow(QWidget):
             self.st = SepThread(
                 api_token=self.api_input.text(),
                 data_table=self.data_table,
-                base_dir_label=self.base_dir_label
+                base_dir_label=self.status_label
             )
             self.st.error_occurred.connect(self.handle_thread_error)
             self.st.progress_updated.connect(self.handle_progress_update)
@@ -714,11 +861,12 @@ class MainWindow(QWidget):
     def handle_thread_error(self, error_msg):
         """Handle errors from separation thread"""
         logger.error(f"Thread error: {error_msg}")
-        self.base_dir_label.setText(f"Error: {error_msg}")
+        self.status_label.setText(f"❌ Error: {error_msg[:50]}")
     
     def handle_progress_update(self, message):
         """Handle progress updates from separation thread"""
         logger.info(f"Progress: {message}")
+        self.status_label.setText(f"✓ {message}")
     
     def clear_files(self):
         """Clear selected files"""
@@ -813,9 +961,6 @@ class MainWindow(QWidget):
             
             if not valid:
                 logger.warning("Validation failed")
-                logger.info(f"API Token: {'Yes' if api_token else 'No'}")
-                logger.info(f"Files: {len(self.selected_files)}")
-                logger.info(f"Algorithms: {len(self.selected_algoritms_list)}")
                 return
             
             # Update thread token
@@ -875,6 +1020,15 @@ class MainWindow(QWidget):
     def start_master(self):
         """Start master algorithm selection dialog"""
         try:
+            if not self.data:
+                QMessageBox.warning(
+                    self,
+                    "No Algorithms",
+                    "Algorithms are still loading or failed to load.\n"
+                    "Please check your internet connection."
+                )
+                return
+            
             separation_dialog = QDialog(self)
             separation_dialog.setWindowTitle("Separation Types")
             separation_dialog.setFixedSize(740, 600)
@@ -885,7 +1039,6 @@ class MainWindow(QWidget):
             self.type_label_master = QLabel("Separation Type")
             self.type_label_master.setStyleSheet(label_style)
             
-            self.data, self.algorithm_fields = get_separation_types()
             sorted_data = {k: v for k, v in sorted(self.data.items())}
             
             self.type_combo_master = QComboBox(separation_dialog)
@@ -1154,10 +1307,14 @@ class MainWindow(QWidget):
             # Stop separation thread
             if hasattr(self, 'st'):
                 self.st.stop()
-                # Wait for thread to finish (max 5 seconds)
                 if not self.st.wait(timeout=5000):
                     logger.warning("Thread did not stop gracefully, terminating...")
                     self.st.terminate()
+            
+            # Stop algo loader if still running
+            if hasattr(self, 'algo_loader') and self.algo_loader.isRunning():
+                self.algo_loader.quit()
+                self.algo_loader.wait(timeout=2000)
             
             # Close database connection
             if connection:
