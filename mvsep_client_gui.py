@@ -401,166 +401,75 @@ class SepThread(QThread):
             logger.info("SepThread stopped")
     
     def process_jobs(self):
-        """Process all jobs in queue"""
-        try:
-            with get_db_cursor() as cursor:
-                cursor.execute('SELECT * FROM Jobs ORDER BY id DESC')
-                jobs = cursor.fetchall()
-                
-                for row, job in enumerate(jobs):
-                    if not self.is_running:
-                        break
-                    
-                    self.process_single_job(job, cursor, row)
+    """Process all jobs in queue - FIXED"""
+    try:
+        # ✅ Get jobs OUTSIDE the context
+        jobs = None
+        with get_db_cursor() as cursor:
+            cursor.execute('SELECT * FROM Jobs ORDER BY id DESC')
+            jobs = cursor.fetchall()
         
-        except sqlite3.Error as e:
-            logger.error(f"Database error in process_jobs: {e}")
-            raise
+        # ✅ Now process jobs with NEW cursors
+        if jobs:
+            for row, job in enumerate(jobs):
+                if not self.is_running:
+                    break
+                self.process_single_job(job, row)
     
-    def process_single_job(self, job, cursor, row):
-        """Process single job"""
-        try:
-            job_id = int(job[0])
-            status = str(job[6])
-            file_path = job[3]
-            separation_type = str(job[7])
-            
-            # Log current status
-            logger.debug(f"Processing job {job_id}: {status}")
-            
-            if status == "Added":
-                self.handle_job_added(job, cursor, job_id, file_path, separation_type)
-            
-            elif status == "Process":
-                self.handle_job_process(job, cursor, job_id)
+    except sqlite3.Error as e:
+        logger.error(f"Database error in process_jobs: {e}")
+        raise
+
+def process_single_job(self, job, row):
+    """Process single job - FIXED: No cursor passed"""
+    try:
+        job_id = int(job[0])
+        status = str(job[6])
+        file_path = job[3]
+        separation_type = str(job[7])
         
-        except Exception as e:
-            logger.error(f"Error processing job {job[0]}: {e}")
+        if status == "Added":
+            self.handle_job_added(job, job_id, file_path, separation_type)
+        elif status == "Process":
+            self.handle_job_process(job, job_id)
     
-    def handle_job_added(self, job, cursor, job_id, file_path, separation_type):
-        """Handle job in Added status"""
-        try:
-            hash_val, status_code = create_separation(
-                file_path, 
-                self.api_token, 
-                separation_type,
-                job[8], job[9], job[10]
-            )
-            
-            with db_lock:
-                if status_code == 200:
-                    cursor.execute('UPDATE Jobs SET hash = ? WHERE id = ?', (hash_val, job[0]))
-                    cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Process", job[0]))
-                    cursor.execute('UPDATE Jobs SET update_time = ? WHERE id = ?', 
-                                 (int(time.time()), job[0]))
-                    
-                    cursor.execute(
-                        'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
-                        (job_id, int(time.time()), "Added -> Process", "")
-                    )
-                    logger.info(f"Job {job_id} moved to Process")
-                    self.progress_updated.emit(f"Job {job_id}: Processing started")
-                else:
-                    cursor.execute(
-                        'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
-                        (job_id, int(time.time()), "Error Start Process", f"Status: {status_code}")
-                    )
-                    logger.error(f"Failed to start separation for job {job_id}: {hash_val}")
-                    self.error_occurred.emit(f"Job {job_id}: Start error - {hash_val}")
+    except Exception as e:
+        logger.error(f"Error processing job {job[0]}: {e}")
+
+def handle_job_added(self, job, job_id, file_path, separation_type):
+    """Handle job in Added status - FIXED"""
+    try:
+        hash_val, status_code = create_separation(
+            file_path, 
+            self.api_token,
+            separation_type,
+            job[8], job[9], job[10]
+        )
         
-        except Exception as e:
-            logger.error(f"Error in handle_job_added: {e}")
-    
-    def handle_job_process(self, job, cursor, job_id):
-        """Handle job in Process status"""
-        try:
-            with db_lock:
+        # ✅ Create NEW cursor for this operation
+        with get_db_cursor() as cursor:
+            if status_code == 200:
+                cursor.execute('UPDATE Jobs SET hash = ? WHERE id = ?', (hash_val, job[0]))
+                cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Process", job[0]))
                 cursor.execute('UPDATE Jobs SET update_time = ? WHERE id = ?', 
                              (int(time.time()), job[0]))
-            
-            success, data = check_result(job[5], timeout=REQUEST_TIMEOUT)
-            
-            if success:
-                self.handle_job_success(job, cursor, job_id, data)
-            else:
-                with db_lock:
-                    cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Error", job[0]))
-                    cursor.execute(
-                        'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
-                        (job_id, int(time.time()), "Process -> Error", data.get("error", "Unknown"))
-                    )
-                logger.error(f"Job {job_id} failed: {data.get('error', 'Unknown')}")
-        
-        except Exception as e:
-            logger.error(f"Error in handle_job_process: {e}")
-    
-    def handle_job_success(self, job, cursor, job_id, data):
-        """Handle successful job"""
-        try:
-            with db_lock:
+                
                 cursor.execute(
                     'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
-                    (job_id, int(time.time()), "Process -> Success", "")
+                    (job_id, int(time.time()), "Added -> Process", "")
                 )
-            
-            files = data.get('data', {}).get('files', [])
-            
-            if not files:
-                with db_lock:
-                    cursor.execute(
-                        'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
-                        (job_id, int(time.time()), "No Files", "")
-                    )
-                logger.warning(f"Job {job_id}: No files returned")
-                return
-            
-            for file_info in files:
-                self.download_job_file(job, cursor, job_id, file_info)
-        
-        except Exception as e:
-            logger.error(f"Error in handle_job_success: {e}")
+                logger.info(f"Job {job_id} moved to Process")
+                self.progress_updated.emit(f"Job {job_id}: Processing started")
+            else:
+                cursor.execute(
+                    'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
+                    (job_id, int(time.time()), "Error Start Process", f"Status: {status_code}")
+                )
+                logger.error(f"Failed to start separation for job {job_id}: {hash_val}")
+                self.error_occurred.emit(f"Job {job_id}: Start error - {hash_val}")
     
-    def download_job_file(self, job, cursor, job_id, file_info):
-        """Download single file for job"""
-        try:
-            url = file_info.get('url', '').replace('\\/', '/')
-            filename = file_info.get('download', 'unknown.wav')
-            
-            if not url:
-                logger.warning(f"Job {job_id}: Empty URL for file {filename}")
-                return
-            
-            with db_lock:
-                cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Download", job[0]))
-                cursor.execute('UPDATE Jobs SET update_time = ? WHERE id = ?',
-                             (int(time.time()), job[0]))
-            
-            success, message = download_file(url, filename, job[4], timeout=DOWNLOAD_TIMEOUT)
-            
-            with db_lock:
-                if success:
-                    cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Complete", job[0]))
-                    cursor.execute(
-                        'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
-                        (job_id, int(time.time()), "Download -> Complete", f"File: {filename}")
-                    )
-                    logger.info(f"Job {job_id}: File downloaded - {filename}")
-                    self.progress_updated.emit(f"Job {job_id}: Complete - {filename}")
-                else:
-                    cursor.execute('UPDATE Jobs SET status = ? WHERE id = ?', ("Error", job[0]))
-                    cursor.execute(
-                        'INSERT INTO Log (job_id, update_time, action, comment) VALUES (?, ?, ?, ?)',
-                        (job_id, int(time.time()), "Download Error", message)
-                    )
-                    logger.error(f"Job {job_id}: Download failed - {message}")
-        
-        except Exception as e:
-            logger.error(f"Error downloading file for job {job_id}: {e}")
-    
-    def stop(self):
-        """Stop thread gracefully"""
-        logger.info("Stopping SepThread...")
-        self.is_running = False
+    except Exception as e:
+        logger.error(f"Error in handle_job_added: {e}")
 
 # ============================================================================
 # DRAG & DROP BUTTON
